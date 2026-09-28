@@ -1,11 +1,13 @@
 """The gateway. Reads incoming HTTP, matches a route, forwards to upstream."""
 
 import logging
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
 
 from app.config import Config
+from app.middleware import RequestContext, run_before, run_after
 from app.proxy import forward
 from app.routes import build_route_table, RouteTable
+from app.stats import STATS
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("mlinzi")
@@ -33,17 +35,33 @@ def create_gateway(route_table: RouteTable | None = None) -> Flask:
             for r in routes.all()
         ])
 
+    @app.route("/gateway/stats")
+    def gateway_stats():
+        return jsonify(STATS.snapshot())
+
     @app.route("/", defaults={"path": ""}, methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
     @app.route("/<path:path>", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
     def gateway(path: str):
-        incoming = request.path
-        route = routes.match(incoming)
+        ctx = RequestContext(method=request.method, path=request.path)
+        run_before(ctx)
 
+        route = routes.match(request.path)
         if route is None:
-            log.info("no route for %s", incoming)
-            return jsonify({"error": "no route", "path": incoming}), 404
+            log.info("no route for %s", request.path)
+            resp = jsonify({"error": "no route", "path": request.path})
+            resp.status_code = 404
+        else:
+            ctx.route_prefix = route.prefix
+            resp = forward(route, timeout=Config.REQUEST_TIMEOUT)
 
-        return forward(route, timeout=Config.REQUEST_TIMEOUT)
+        ctx.status_code = resp.status_code
+        run_after(ctx)
+
+        # Attach middleware-produced headers to the response
+        for k, v in ctx.response_headers.items():
+            resp.headers[k] = v
+
+        return resp
 
     return app
 
