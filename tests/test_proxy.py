@@ -11,8 +11,6 @@ from app.routes import Route, RouteTable
 from app.stats import STATS
 
 
-# --- Fixture: spin up a real echo upstream in a background thread ----------
-
 @pytest.fixture(scope="module")
 def echo_upstream():
     """Start the echo upstream on a test port, yield the base URL, tear down."""
@@ -23,25 +21,22 @@ def echo_upstream():
         daemon=True,
     )
     t.start()
-    time.sleep(0.5)  # let it bind
+    time.sleep(0.5)
     yield f"http://127.0.0.1:{port}"
 
 
 @pytest.fixture
 def gateway_client(echo_upstream):
-    """A Flask test client for the gateway wired to the real echo upstream."""
     STATS.reset()
     routes = RouteTable([
-        Route("/echo", echo_upstream, strip_prefix=False),
-        Route("/api", echo_upstream, strip_prefix=True),
+        Route("/echo", (echo_upstream,), strip_prefix=False),
+        Route("/api", (echo_upstream,), strip_prefix=True),
     ])
     app = create_gateway(route_table=routes)
     app.config["TESTING"] = True
     with app.test_client() as c:
         yield c
 
-
-# --- Route matching through the gateway ------------------------------------
 
 def test_health_endpoint(gateway_client):
     r = gateway_client.get("/gateway/health")
@@ -67,8 +62,6 @@ def test_stats_endpoint_after_requests(gateway_client):
     assert body["requests_by_route"]["/echo"] == 1
     assert body["requests_by_route"]["/api"] == 1
 
-
-# --- Forwarding ------------------------------------------------------------
 
 def test_forward_with_prefix_preserved(gateway_client):
     r = gateway_client.get("/echo/hello")
@@ -105,16 +98,12 @@ def test_forward_post_body(gateway_client):
     assert "widget" in body["body"]
 
 
-# --- Middleware headers ----------------------------------------------------
-
 def test_response_includes_request_id_and_timing(gateway_client):
     r = gateway_client.get("/echo/hello")
     assert "X-Request-ID" in r.headers
     assert "X-Gateway-Time-Ms" in r.headers
     assert len(r.headers["X-Request-ID"]) == 16
 
-
-# --- Error paths -----------------------------------------------------------
 
 def test_unmatched_path_returns_404(gateway_client):
     r = gateway_client.get("/nonexistent")
@@ -123,10 +112,10 @@ def test_unmatched_path_returns_404(gateway_client):
 
 
 def test_unreachable_upstream_returns_502():
-    """Point a route at a port that isn't listening."""
+    """A route with a live-looking URL that nothing listens on returns 502."""
     STATS.reset()
     routes = RouteTable([
-        Route("/dead", "http://127.0.0.1:1", strip_prefix=False),
+        Route("/dead", ("http://127.0.0.1:1",), strip_prefix=False),
     ])
     app = create_gateway(route_table=routes)
     app.config["TESTING"] = True
@@ -134,15 +123,16 @@ def test_unreachable_upstream_returns_502():
         r = c.get("/dead/anything")
     assert r.status_code == 502
     assert b"unreachable" in r.data
-    # --- Rate limiting ---------------------------------------------------------
+
+
+# --- Rate limiting ---------------------------------------------------------
 
 def test_rate_limit_allows_burst_then_429():
-    """With capacity=2, first two requests pass, third is rate limited."""
     from app.ratelimit import Limit
 
     STATS.reset()
     routes = RouteTable([
-        Route("/limited", "http://127.0.0.1:9101", strip_prefix=False,
+        Route("/limited", ("http://127.0.0.1:9101",), strip_prefix=False,
               limit=Limit(capacity=2, refill_per_second=0.001)),
     ])
     app = create_gateway(route_table=routes)
@@ -161,7 +151,7 @@ def test_rate_limit_headers_on_success():
 
     STATS.reset()
     routes = RouteTable([
-        Route("/rl", "http://127.0.0.1:9101", strip_prefix=False,
+        Route("/rl", ("http://127.0.0.1:9101",), strip_prefix=False,
               limit=Limit(capacity=5, refill_per_second=0.001)),
     ])
     app = create_gateway(route_table=routes)
@@ -179,14 +169,14 @@ def test_rate_limit_headers_on_429():
 
     STATS.reset()
     routes = RouteTable([
-        Route("/rl", "http://127.0.0.1:9101", strip_prefix=False,
+        Route("/rl", ("http://127.0.0.1:9101",), strip_prefix=False,
               limit=Limit(capacity=1, refill_per_second=0.001)),
     ])
     app = create_gateway(route_table=routes)
     app.config["TESTING"] = True
 
     with app.test_client() as c:
-        c.get("/rl/x")  # consumes the only token
+        c.get("/rl/x")
         r = c.get("/rl/y")
         assert r.status_code == 429
         assert r.headers["X-RateLimit-Limit"] == "1"
@@ -195,14 +185,13 @@ def test_rate_limit_headers_on_429():
 
 
 def test_rate_limit_is_per_route():
-    """Two routes have independent buckets, even from the same client."""
     from app.ratelimit import Limit
 
     STATS.reset()
     routes = RouteTable([
-        Route("/a", "http://127.0.0.1:9101", strip_prefix=False,
+        Route("/a", ("http://127.0.0.1:9101",), strip_prefix=False,
               limit=Limit(capacity=1, refill_per_second=0.001)),
-        Route("/b", "http://127.0.0.1:9101", strip_prefix=False,
+        Route("/b", ("http://127.0.0.1:9101",), strip_prefix=False,
               limit=Limit(capacity=1, refill_per_second=0.001)),
     ])
     app = create_gateway(route_table=routes)
@@ -211,15 +200,13 @@ def test_rate_limit_is_per_route():
     with app.test_client() as c:
         assert c.get("/a/1").status_code == 200
         assert c.get("/a/2").status_code == 429
-        # /b has its own bucket, still fresh
         assert c.get("/b/1").status_code == 200
 
 
 def test_unlimited_route_has_no_ratelimit_headers():
-    """Routes without a limit shouldn't get X-RateLimit-* headers."""
     STATS.reset()
     routes = RouteTable([
-        Route("/free", "http://127.0.0.1:9101", strip_prefix=False, limit=None),
+        Route("/free", ("http://127.0.0.1:9101",), strip_prefix=False, limit=None),
     ])
     app = create_gateway(route_table=routes)
     app.config["TESTING"] = True
@@ -235,7 +222,7 @@ def test_rate_limited_requests_counted_in_stats():
 
     STATS.reset()
     routes = RouteTable([
-        Route("/s", "http://127.0.0.1:9101", strip_prefix=False,
+        Route("/s", ("http://127.0.0.1:9101",), strip_prefix=False,
               limit=Limit(capacity=1, refill_per_second=0.001)),
     ])
     app = create_gateway(route_table=routes)
@@ -243,9 +230,47 @@ def test_rate_limited_requests_counted_in_stats():
 
     with app.test_client() as c:
         c.get("/s/1")
-        c.get("/s/2")  # 429
-        c.get("/s/3")  # 429
-
+        c.get("/s/2")
+        c.get("/s/3")
         snap = c.get("/gateway/stats").get_json()
     assert snap["rate_limited_requests"] == 2
     assert snap["requests_by_status"]["429"] == 2
+
+
+# --- Load balancing / 503 --------------------------------------------------
+
+def test_no_healthy_upstream_returns_503():
+    """A route with all upstreams marked unhealthy returns 503."""
+    STATS.reset()
+    routes = RouteTable([
+        Route("/pool", ("http://127.0.0.1:9101",), strip_prefix=False),
+    ])
+    app = create_gateway(route_table=routes)
+    app.config["TESTING"] = True
+
+    # Reach in and mark the only upstream unhealthy
+    pools = app.extensions["pools"]
+    pool = pools.pool_for("/pool")
+    pool.upstreams()[0].mark_unhealthy("test")
+
+    with app.test_client() as c:
+        r = c.get("/pool/x")
+        assert r.status_code == 503
+        assert r.get_json()["error"] == "no healthy upstream"
+
+
+def test_routes_endpoint_shows_upstreams(echo_upstream):
+    STATS.reset()
+    routes = RouteTable([
+        Route("/multi", (echo_upstream,), strip_prefix=False),
+    ])
+    app = create_gateway(route_table=routes)
+    app.config["TESTING"] = True
+
+    with app.test_client() as c:
+        r = c.get("/gateway/routes")
+        body = r.get_json()
+        multi = next(x for x in body if x["prefix"] == "/multi")
+        assert len(multi["upstreams"]) == 1
+        assert multi["upstreams"][0]["url"] == echo_upstream
+        assert multi["upstreams"][0]["healthy"] is True

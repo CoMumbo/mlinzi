@@ -1,7 +1,8 @@
-"""Route table: maps path prefixes to upstream services.
+"""Route table: maps path prefixes to upstream pools.
 
 A gateway's job starts here. Given an incoming request path, find the
-longest matching prefix and hand the request to that upstream.
+longest matching prefix and hand the request to one of that route's
+upstream instances.
 """
 
 from dataclasses import dataclass
@@ -12,9 +13,9 @@ from app.ratelimit import Limit
 @dataclass(frozen=True)
 class Route:
     prefix: str
-    upstream: str                    # base URL, e.g. "http://127.0.0.1:9001"
-    strip_prefix: bool = False       # remove `prefix` before forwarding
-    limit: Limit | None = None       # rate limit policy, or None for unlimited
+    upstreams: tuple[str, ...]      # base URLs, e.g. ("http://127.0.0.1:9001",)
+    strip_prefix: bool = False
+    limit: Limit | None = None      # rate limit policy, or None for unlimited
 
     def matches(self, path: str) -> bool:
         return path == self.prefix or path.startswith(self.prefix + "/")
@@ -60,13 +61,13 @@ def build_route_table() -> RouteTable:
     return RouteTable([
         Route(
             prefix="/echo",
-            upstream=echo_base,
+            upstreams=(echo_base,),
             strip_prefix=False,
             limit=Limit(capacity=10, refill_per_second=2.0),
         ),
         Route(
             prefix="/api",
-            upstream=echo_base,
+            upstreams=(echo_base,),
             strip_prefix=True,
             limit=Limit(capacity=5, refill_per_second=1.0),
         ),

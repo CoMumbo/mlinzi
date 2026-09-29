@@ -2,9 +2,10 @@
 
 A small API gateway written in Python. Routes incoming requests to upstream
 services based on path prefix, applies token-bucket rate limits per route
-and per client, strips path prefixes when configured, returns proper
-gateway errors (502, 504) when upstreams are unavailable, and exposes
-live request stats.
+and per client, load-balances across multiple upstream instances with
+background health checks, strips path prefixes when configured, returns
+proper gateway errors (502, 503, 504) when upstreams are unavailable, and
+exposes live request stats.
 
 The name is Swahili for "guard" or "watchman".
 
@@ -13,12 +14,14 @@ The name is Swahili for "guard" or "watchman".
 Data plane (proxying):
 
 - Route table with longest-prefix matching
-- Request forwarding via `requests`
+- Upstream pools with round-robin load balancing
+- Background health checks that remove failing instances from rotation
 - Path prefix stripping (e.g. `/api/users/1` becomes `/users/1` on the upstream)
 - Query string and request body pass-through
 - Hop-by-hop header filtering
 - 404 for unmatched routes
 - 502 for unreachable upstreams
+- 503 when no upstream instance is healthy
 - 504 for timeouts
 
 Rate limiting:
@@ -31,7 +34,7 @@ Rate limiting:
 Management plane:
 
 - `/gateway/health` — liveness and route count
-- `/gateway/routes` — list of configured routes and their limits
+- `/gateway/routes` — list of routes, upstreams, health, and limits
 - `/gateway/stats` — request counters, rate-limit counts, latency percentiles
 
 Middleware, run on every data-plane request:
@@ -44,18 +47,21 @@ Middleware, run on every data-plane request:
 ## Architecture
 
 ```
-Client --> mlinzi (port 9000) --> upstream (port 9001, etc.)
+Client --> mlinzi (port 9000) --> upstream pool (port 9001, 9002, ...)
 
-             |-- route table (prefix -> upstream + limit)
+             |-- route table (prefix -> upstream pool + limit)
              |-- rate limiter (token bucket per route + client)
+             |-- upstream pool (round-robin across healthy instances)
+             |-- health checker (background thread, pings each upstream)
              |-- proxy (forwards via requests)
              |-- middleware (request id, timing, logging, stats)
              |-- management endpoints under /gateway/*
 ```
 
 The gateway is a single Flask process. Route matching, rate limiting,
-forwarding, and middleware all run synchronously per request. Concurrent
-requests are handled by Flask's threaded server.
+upstream selection, forwarding, and middleware all run synchronously per
+request. Concurrent requests are handled by Flask's threaded server.
+Health checks run on their own daemon threads.
 
 ## Running it
 
@@ -129,7 +135,7 @@ Routes and rate limits are defined in `app/routes.py`:
 ```python
 Route(
     prefix="/api",
-    upstream="http://127.0.0.1:9001",
+    upstreams=("http://127.0.0.1:9001",),
     strip_prefix=True,
     limit=Limit(capacity=5, refill_per_second=1.0),
 )
@@ -152,16 +158,39 @@ Gateway, Cloudflare, and Stripe.
 Limits are small in the default route table so the demo and tests hit
 them quickly. Real deployments would set them from config.
 
+## Load balancing and health checks
+
+Each route can point at multiple upstream instances:
+
+```python
+Route(
+    prefix="/multi",
+    upstreams=("http://127.0.0.1:9001", "http://127.0.0.1:9002"),
+)
+```
+
+The pool round-robins across healthy instances. A background health checker
+pings each instance's `/gateway/health` every 5 seconds. Instances that
+fail are removed from rotation. When a failing instance starts responding
+again, it rejoins automatically.
+
+If no instance in a route's pool is healthy, the gateway returns
+**503 Service Unavailable** with a JSON body.
+
+The health checker runs on its own daemon thread and never blocks request
+handling. State changes are logged once per transition rather than on
+every check.
+
 ## Tests
 
 ```bash
 python -m pytest
 ```
 
-Fifty-one tests covering route matching, prefix stripping, forwarding
+Fifty-three tests covering route matching, prefix stripping, forwarding
 through a real echo upstream, middleware headers, stats collection,
-gateway error paths (404, 502), and the token bucket algorithm including
-refill, capacity caps, and per-key isolation.
+gateway error paths (404, 502, 503), the token bucket algorithm including
+refill and capacity caps, and per-route rate limit isolation.
 
 ## Project layout
 
@@ -170,7 +199,10 @@ mlinzi/
 ├── app/
 │   ├── gateway.py        Flask app, request handler
 │   ├── proxy.py          forwarding logic
-│   ├── routes.py         route table with per-route limits
+│   ├── routes.py         route table with per-route pools and limits
+│   ├── upstream.py       upstream instances and round-robin pools
+│   ├── health.py         background health checker thread
+│   ├── pool_store.py     one pool per route, plus health checkers
 │   ├── ratelimit.py      token bucket and limiter registry
 │   ├── limiter_store.py  one limiter per route
 │   ├── middleware.py     request id, timing, logging, stats, ratelimit headers
@@ -186,11 +218,10 @@ mlinzi/
 
 Next sessions:
 
-- Load balancing across multiple upstreams
-- Upstream health checks
 - Circuit breaker
 - Architecture diagram
 - `docs/DESIGN.md` and `docs/FAILURES.md`
+- End-to-end demo script
 
 ## License
 
