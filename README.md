@@ -47,32 +47,32 @@ Middleware, run on every data-plane request:
 
 ## Architecture
 
-```
-Client --> mlinzi (port 9000) --> upstream pool (port 9001, 9002, ...)
-
-             |-- route table (prefix -> upstream pool + limit)
-             |-- rate limiter (token bucket per route + client)
-             |-- upstream pool (round-robin across eligible instances)
-             |-- health checker (background thread, pings each upstream)
-             |-- circuit breaker (per upstream, reactive to request outcomes)
-             |-- proxy (forwards via requests)
-             |-- middleware (request id, timing, logging, stats)
-             |-- management endpoints under /gateway/*
-```
+![Architecture diagram](docs/architecture.png)
 
 The gateway is a single Flask process. Route matching, rate limiting,
 upstream selection, forwarding, and middleware all run synchronously per
 request. Concurrent requests are handled by Flask's threaded server.
 Health checks run on their own daemon threads.
 
-## Running it
+## Try the demo first
+
+The fastest way to see the whole gateway work:
 
 ```bash
 python -m venv .venv
 source .venv/Scripts/activate    # Windows Git Bash
 # or: source .venv/bin/activate  # macOS / Linux
 pip install -r requirements.txt
+
+python -m scripts.demo
 ```
+
+The demo starts the echo upstream and the gateway in-process, fires a
+series of requests that exercise forwarding, prefix stripping, query and
+body pass-through, 404s, rate limiting, and stats, then prints a summary.
+It exits in about 10 seconds.
+
+## Running it manually
 
 In one terminal, start the bundled echo upstream:
 
@@ -270,19 +270,27 @@ mlinzi/
 │   ├── config.py         env-based settings
 │   └── echo_upstream.py  bundled test upstream
 ├── scripts/
+│   ├── demo.py           end-to-end demo
 │   └── flaky_upstream.py toggleable failing upstream for testing
 ├── tests/
 ├── docs/
+│   └── architecture.png
 └── requirements.txt
 ```
 
-## Roadmap
+## Design notes
 
-Next sessions:
+Two documents cover the why behind mlinzi:
 
-- Architecture diagram
-- `docs/DESIGN.md` and `docs/FAILURES.md`
-- End-to-end demo script
+- [`docs/DESIGN.md`](docs/DESIGN.md) — token bucket math, round-robin
+  selection, circuit breaker state machine, middleware chain, and what was
+  deliberately left out.
+- [`docs/FAILURES.md`](docs/FAILURES.md) — how the gateway behaves when
+  things go wrong: upstream crashes, backpressure, rate limiter hot spots,
+  and known gaps.
+
+If you're reading this to evaluate the project, those two documents are
+worth more than the code.
 
 ## License
 
