@@ -4,6 +4,7 @@ import logging
 from flask import Flask, Response, jsonify, request
 
 from app.config import Config
+from app.limiter_store import LimiterStore
 from app.middleware import RequestContext, run_before, run_after
 from app.proxy import forward
 from app.routes import build_route_table, RouteTable
@@ -16,13 +17,11 @@ log = logging.getLogger("mlinzi")
 def create_gateway(route_table: RouteTable | None = None) -> Flask:
     app = Flask("mlinzi")
     routes = route_table or build_route_table()
+    limiters = LimiterStore(routes)
 
     @app.route("/gateway/health")
     def gateway_health():
-        return jsonify({
-            "status": "ok",
-            "routes": len(routes),
-        })
+        return jsonify({"status": "ok", "routes": len(routes)})
 
     @app.route("/gateway/routes")
     def gateway_routes():
@@ -31,6 +30,7 @@ def create_gateway(route_table: RouteTable | None = None) -> Flask:
                 "prefix": r.prefix,
                 "upstream": r.upstream,
                 "strip_prefix": r.strip_prefix,
+                "limit": (str(r.limit) if r.limit else None),
             }
             for r in routes.all()
         ])
@@ -42,7 +42,11 @@ def create_gateway(route_table: RouteTable | None = None) -> Flask:
     @app.route("/", defaults={"path": ""}, methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
     @app.route("/<path:path>", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
     def gateway(path: str):
-        ctx = RequestContext(method=request.method, path=request.path)
+        ctx = RequestContext(
+            method=request.method,
+            path=request.path,
+            client_ip=request.remote_addr or "unknown",
+        )
         run_before(ctx)
 
         route = routes.match(request.path)
@@ -52,12 +56,29 @@ def create_gateway(route_table: RouteTable | None = None) -> Flask:
             resp.status_code = 404
         else:
             ctx.route_prefix = route.prefix
-            resp = forward(route, timeout=Config.REQUEST_TIMEOUT)
+
+            # Rate limit check before forwarding
+            decision = limiters.check(route.prefix, ctx.client_ip)
+            ctx.rate_decision = decision
+
+            if decision is not None and not decision.allowed:
+                log.info(
+                    "rate limit exceeded route=%s client=%s retry_after=%.2fs",
+                    route.prefix, ctx.client_ip, decision.retry_after_seconds,
+                )
+                resp = jsonify({
+                    "error": "rate limit exceeded",
+                    "route": route.prefix,
+                    "limit": decision.limit,
+                    "retry_after_seconds": round(decision.retry_after_seconds, 2),
+                })
+                resp.status_code = 429
+            else:
+                resp = forward(route, timeout=Config.REQUEST_TIMEOUT)
 
         ctx.status_code = resp.status_code
         run_after(ctx)
 
-        # Attach middleware-produced headers to the response
         for k, v in ctx.response_headers.items():
             resp.headers[k] = v
 

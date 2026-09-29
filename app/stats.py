@@ -1,15 +1,4 @@
-"""Thread-safe in-memory stats collector for the gateway.
-
-Tracks:
-- total requests
-- requests grouped by HTTP status code
-- requests grouped by route prefix
-- per-route latency samples (kept in a bounded ring)
-- process start time (for uptime)
-
-Designed to be extended later (persistence, Prometheus export). For now it
-lives in memory and resets when the gateway restarts.
-"""
+"""Thread-safe in-memory stats collector for the gateway."""
 
 import threading
 import time
@@ -21,19 +10,14 @@ class Stats:
         self._lock = threading.Lock()
         self._started_at = time.time()
         self._total = 0
+        self._rejected = 0
         self._by_status: dict[int, int] = defaultdict(int)
         self._by_route: dict[str, int] = defaultdict(int)
-        # Bounded deque per route to keep memory flat
         self._latencies_ms: dict[str, deque[float]] = defaultdict(
             lambda: deque(maxlen=latency_window)
         )
 
-    def record(
-        self,
-        route_prefix: str | None,
-        status_code: int,
-        latency_ms: float,
-    ) -> None:
+    def record(self, route_prefix: str | None, status_code: int, latency_ms: float) -> None:
         with self._lock:
             self._total += 1
             self._by_status[status_code] += 1
@@ -41,9 +25,15 @@ class Stats:
             self._by_route[key] += 1
             self._latencies_ms[key].append(latency_ms)
 
+    def record_rejected(self) -> None:
+        """Increment the rate-limited request counter."""
+        with self._lock:
+            self._rejected += 1
+
     def snapshot(self) -> dict:
         with self._lock:
             total = self._total
+            rejected = self._rejected
             by_status = dict(self._by_status)
             by_route = dict(self._by_route)
             latencies = {k: list(v) for k, v in self._latencies_ms.items()}
@@ -57,6 +47,7 @@ class Stats:
         return {
             "uptime_seconds": round(uptime, 2),
             "total_requests": total,
+            "rate_limited_requests": rejected,
             "requests_by_status": {str(k): v for k, v in sorted(by_status.items())},
             "requests_by_route": dict(sorted(by_route.items())),
             "avg_latency_ms": round(avg_latency, 2),
@@ -67,6 +58,7 @@ class Stats:
     def reset(self) -> None:
         with self._lock:
             self._total = 0
+            self._rejected = 0
             self._by_status.clear()
             self._by_route.clear()
             self._latencies_ms.clear()
@@ -85,5 +77,4 @@ def _percentile(samples: list[float], pct: float) -> float:
     return s[f] + (s[c] - s[f]) * (k - f)
 
 
-# Module-level singleton. The gateway uses this directly.
 STATS = Stats()

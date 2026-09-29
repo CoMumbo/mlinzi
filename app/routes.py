@@ -6,12 +6,15 @@ longest matching prefix and hand the request to that upstream.
 
 from dataclasses import dataclass
 
+from app.ratelimit import Limit
+
 
 @dataclass(frozen=True)
 class Route:
     prefix: str
-    upstream: str           # base URL of the upstream, e.g. "http://127.0.0.1:9001"
-    strip_prefix: bool = False  # if True, remove `prefix` before forwarding
+    upstream: str                    # base URL, e.g. "http://127.0.0.1:9001"
+    strip_prefix: bool = False       # remove `prefix` before forwarding
+    limit: Limit | None = None       # rate limit policy, or None for unlimited
 
     def matches(self, path: str) -> bool:
         return path == self.prefix or path.startswith(self.prefix + "/")
@@ -26,12 +29,10 @@ class RouteTable:
             self.add(r)
 
     def add(self, route: Route) -> None:
-        # Reject duplicates so a typo doesn't silently shadow a real route
         for existing in self._routes:
             if existing.prefix == route.prefix:
                 raise ValueError(f"duplicate route prefix: {route.prefix}")
         self._routes.append(route)
-        # Longest prefix first so more specific routes win
         self._routes.sort(key=lambda r: len(r.prefix), reverse=True)
 
     def match(self, path: str) -> Route | None:
@@ -50,14 +51,23 @@ class RouteTable:
 def build_route_table() -> RouteTable:
     """Build the default route table for this gateway.
 
-    The bundled echo upstream is the default target so the demo and tests
-    work out of the box. Real deployments would load routes from config.
+    Limits are intentionally small so the demo and tests hit them quickly.
     """
     from app.config import Config
 
     echo_base = f"http://127.0.0.1:{Config.ECHO_PORT}"
 
     return RouteTable([
-        Route(prefix="/echo", upstream=echo_base, strip_prefix=False),
-        Route(prefix="/api", upstream=echo_base, strip_prefix=True),
+        Route(
+            prefix="/echo",
+            upstream=echo_base,
+            strip_prefix=False,
+            limit=Limit(capacity=10, refill_per_second=2.0),
+        ),
+        Route(
+            prefix="/api",
+            upstream=echo_base,
+            strip_prefix=True,
+            limit=Limit(capacity=5, refill_per_second=1.0),
+        ),
     ])

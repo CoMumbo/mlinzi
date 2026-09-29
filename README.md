@@ -1,8 +1,9 @@
 # mlinzi
 
 A small API gateway written in Python. Routes incoming requests to upstream
-services based on path prefix, strips path prefixes when configured, returns
-proper gateway errors (502, 504) when upstreams are unavailable, and exposes
+services based on path prefix, applies token-bucket rate limits per route
+and per client, strips path prefixes when configured, returns proper
+gateway errors (502, 504) when upstreams are unavailable, and exposes
 live request stats.
 
 The name is Swahili for "guard" or "watchman".
@@ -20,33 +21,41 @@ Data plane (proxying):
 - 502 for unreachable upstreams
 - 504 for timeouts
 
+Rate limiting:
+
+- Token bucket algorithm, per route and per client
+- Configurable capacity (burst) and refill rate (sustained)
+- Returns 429 with `Retry-After` and `X-RateLimit-*` headers
+- Independent buckets per route
+
 Management plane:
 
 - `/gateway/health` — liveness and route count
-- `/gateway/routes` — list of configured routes
-- `/gateway/stats` — live request counters and latency percentiles
+- `/gateway/routes` — list of configured routes and their limits
+- `/gateway/stats` — request counters, rate-limit counts, latency percentiles
 
 Middleware, run on every data-plane request:
 
 - `X-Request-ID` — unique per request, attached to the response
 - `X-Gateway-Time-Ms` — server-side processing time
-- Structured logging with method, path, status, route, and duration
-- Stats collection (total, by status, by route, avg/p95/p99 latency)
+- Structured logging with method, path, status, route, duration, client
+- Stats collection including rate-limited request count
 
 ## Architecture
 
 ```
 Client --> mlinzi (port 9000) --> upstream (port 9001, etc.)
 
-             |-- route table (prefix -> upstream)
+             |-- route table (prefix -> upstream + limit)
+             |-- rate limiter (token bucket per route + client)
              |-- proxy (forwards via requests)
              |-- middleware (request id, timing, logging, stats)
              |-- management endpoints under /gateway/*
 ```
 
-The gateway is a single Flask process. Route matching, forwarding, and
-middleware all run synchronously per request. Concurrent requests are
-handled by Flask's threaded server.
+The gateway is a single Flask process. Route matching, rate limiting,
+forwarding, and middleware all run synchronously per request. Concurrent
+requests are handled by Flask's threaded server.
 
 ## Running it
 
@@ -86,25 +95,24 @@ Forward with prefix stripped:
 curl http://127.0.0.1:9000/api/users/1
 ```
 
-Query string pass-through:
+Trigger the rate limit on `/api` (5 burst, 1/s sustained):
 
 ```bash
-curl "http://127.0.0.1:9000/echo/search?q=hello&limit=10"
+for i in $(seq 1 8); do
+  curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:9000/api/test
+done
 ```
 
-POST with a body:
+You will see a few 200s followed by 429s.
+
+Inspect the 429 response:
 
 ```bash
-curl -X POST http://127.0.0.1:9000/api/items \
-  -H "Content-Type: application/json" \
-  -d '{"name": "widget"}'
+curl -i http://127.0.0.1:9000/api/test
 ```
 
-Unmatched route:
-
-```bash
-curl http://127.0.0.1:9000/unknown/path
-```
+Look for `X-RateLimit-Limit`, `X-RateLimit-Remaining`, and `Retry-After`
+headers.
 
 Management endpoints:
 
@@ -114,25 +122,35 @@ curl http://127.0.0.1:9000/gateway/routes
 curl http://127.0.0.1:9000/gateway/stats
 ```
 
-Every forwarded response includes:
-
-```
-X-Request-ID: 0a93dfe7a53549c5
-X-Gateway-Time-Ms: 28.33
-```
-
 ## Route configuration
 
-Routes are defined in `app/routes.py`:
+Routes and rate limits are defined in `app/routes.py`:
 
 ```python
-Route(prefix="/echo", upstream="http://127.0.0.1:9001", strip_prefix=False)
-Route(prefix="/api",  upstream="http://127.0.0.1:9001", strip_prefix=True)
+Route(
+    prefix="/api",
+    upstream="http://127.0.0.1:9001",
+    strip_prefix=True,
+    limit=Limit(capacity=5, refill_per_second=1.0),
+)
 ```
 
-The longest matching prefix wins. `/api` provides a default for everything
-under `/api`, but a more specific route like `/api/users` would override it
-for that subtree.
+The longest matching prefix wins. `limit=None` means the route is
+unlimited.
+
+## How rate limiting works
+
+Each route has its own `RateLimiter`. Each client (identified by IP)
+gets its own token bucket within that limiter. A bucket starts full at
+`capacity`, refills at `refill_per_second`, and each request consumes
+one token.
+
+Burst behavior is bounded by `capacity`. Sustained throughput is bounded
+by `refill_per_second`. This is the same algorithm used by AWS API
+Gateway, Cloudflare, and Stripe.
+
+Limits are small in the default route table so the demo and tests hit
+them quickly. Real deployments would set them from config.
 
 ## Tests
 
@@ -140,9 +158,10 @@ for that subtree.
 python -m pytest
 ```
 
-Thirty-three tests covering route matching, prefix stripping, forwarding
-through a real echo upstream, middleware headers, stats collection, and
-gateway error paths (404, 502).
+Fifty-one tests covering route matching, prefix stripping, forwarding
+through a real echo upstream, middleware headers, stats collection,
+gateway error paths (404, 502), and the token bucket algorithm including
+refill, capacity caps, and per-key isolation.
 
 ## Project layout
 
@@ -151,8 +170,10 @@ mlinzi/
 ├── app/
 │   ├── gateway.py        Flask app, request handler
 │   ├── proxy.py          forwarding logic
-│   ├── routes.py         route table (prefix -> upstream)
-│   ├── middleware.py     request id, timing, logging, stats
+│   ├── routes.py         route table with per-route limits
+│   ├── ratelimit.py      token bucket and limiter registry
+│   ├── limiter_store.py  one limiter per route
+│   ├── middleware.py     request id, timing, logging, stats, ratelimit headers
 │   ├── stats.py          thread-safe request counters
 │   ├── config.py         env-based settings
 │   └── echo_upstream.py  bundled test upstream
@@ -165,11 +186,11 @@ mlinzi/
 
 Next sessions:
 
-- Rate limiting (token bucket, per-IP and per-route)
 - Load balancing across multiple upstreams
 - Upstream health checks
 - Circuit breaker
 - Architecture diagram
+- `docs/DESIGN.md` and `docs/FAILURES.md`
 
 ## License
 

@@ -134,3 +134,118 @@ def test_unreachable_upstream_returns_502():
         r = c.get("/dead/anything")
     assert r.status_code == 502
     assert b"unreachable" in r.data
+    # --- Rate limiting ---------------------------------------------------------
+
+def test_rate_limit_allows_burst_then_429():
+    """With capacity=2, first two requests pass, third is rate limited."""
+    from app.ratelimit import Limit
+
+    STATS.reset()
+    routes = RouteTable([
+        Route("/limited", "http://127.0.0.1:9101", strip_prefix=False,
+              limit=Limit(capacity=2, refill_per_second=0.001)),
+    ])
+    app = create_gateway(route_table=routes)
+    app.config["TESTING"] = True
+
+    with app.test_client() as c:
+        assert c.get("/limited/a").status_code == 200
+        assert c.get("/limited/b").status_code == 200
+        r = c.get("/limited/c")
+        assert r.status_code == 429
+        assert r.get_json()["error"] == "rate limit exceeded"
+
+
+def test_rate_limit_headers_on_success():
+    from app.ratelimit import Limit
+
+    STATS.reset()
+    routes = RouteTable([
+        Route("/rl", "http://127.0.0.1:9101", strip_prefix=False,
+              limit=Limit(capacity=5, refill_per_second=0.001)),
+    ])
+    app = create_gateway(route_table=routes)
+    app.config["TESTING"] = True
+
+    with app.test_client() as c:
+        r = c.get("/rl/x")
+        assert r.status_code == 200
+        assert r.headers["X-RateLimit-Limit"] == "5"
+        assert r.headers["X-RateLimit-Remaining"] == "4"
+
+
+def test_rate_limit_headers_on_429():
+    from app.ratelimit import Limit
+
+    STATS.reset()
+    routes = RouteTable([
+        Route("/rl", "http://127.0.0.1:9101", strip_prefix=False,
+              limit=Limit(capacity=1, refill_per_second=0.001)),
+    ])
+    app = create_gateway(route_table=routes)
+    app.config["TESTING"] = True
+
+    with app.test_client() as c:
+        c.get("/rl/x")  # consumes the only token
+        r = c.get("/rl/y")
+        assert r.status_code == 429
+        assert r.headers["X-RateLimit-Limit"] == "1"
+        assert r.headers["X-RateLimit-Remaining"] == "0"
+        assert "Retry-After" in r.headers
+
+
+def test_rate_limit_is_per_route():
+    """Two routes have independent buckets, even from the same client."""
+    from app.ratelimit import Limit
+
+    STATS.reset()
+    routes = RouteTable([
+        Route("/a", "http://127.0.0.1:9101", strip_prefix=False,
+              limit=Limit(capacity=1, refill_per_second=0.001)),
+        Route("/b", "http://127.0.0.1:9101", strip_prefix=False,
+              limit=Limit(capacity=1, refill_per_second=0.001)),
+    ])
+    app = create_gateway(route_table=routes)
+    app.config["TESTING"] = True
+
+    with app.test_client() as c:
+        assert c.get("/a/1").status_code == 200
+        assert c.get("/a/2").status_code == 429
+        # /b has its own bucket, still fresh
+        assert c.get("/b/1").status_code == 200
+
+
+def test_unlimited_route_has_no_ratelimit_headers():
+    """Routes without a limit shouldn't get X-RateLimit-* headers."""
+    STATS.reset()
+    routes = RouteTable([
+        Route("/free", "http://127.0.0.1:9101", strip_prefix=False, limit=None),
+    ])
+    app = create_gateway(route_table=routes)
+    app.config["TESTING"] = True
+
+    with app.test_client() as c:
+        r = c.get("/free/x")
+        assert r.status_code == 200
+        assert "X-RateLimit-Limit" not in r.headers
+
+
+def test_rate_limited_requests_counted_in_stats():
+    from app.ratelimit import Limit
+
+    STATS.reset()
+    routes = RouteTable([
+        Route("/s", "http://127.0.0.1:9101", strip_prefix=False,
+              limit=Limit(capacity=1, refill_per_second=0.001)),
+    ])
+    app = create_gateway(route_table=routes)
+    app.config["TESTING"] = True
+
+    with app.test_client() as c:
+        c.get("/s/1")
+        c.get("/s/2")  # 429
+        c.get("/s/3")  # 429
+
+        snap = c.get("/gateway/stats").get_json()
+    assert snap["rate_limited_requests"] == 2
+    assert snap["requests_by_status"]["429"] == 2
