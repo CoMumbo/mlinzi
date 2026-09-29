@@ -274,3 +274,121 @@ def test_routes_endpoint_shows_upstreams(echo_upstream):
         assert len(multi["upstreams"]) == 1
         assert multi["upstreams"][0]["url"] == echo_upstream
         assert multi["upstreams"][0]["healthy"] is True
+        # --- Circuit breaker integration -------------------------------------------
+
+def test_breaker_trips_and_blocks_upstream():
+    """Force the breaker open and confirm the pool routes around it."""
+    STATS.reset()
+    routes = RouteTable([
+        Route("/cb", ("http://127.0.0.1:9101",), strip_prefix=False),
+    ])
+    app = create_gateway(route_table=routes)
+    app.config["TESTING"] = True
+
+    pools = app.extensions["pools"]
+    pool = pools.pool_for("/cb")
+    upstream = pool.upstreams()[0]
+
+    upstream.breaker.force_open()
+
+    with app.test_client() as c:
+        r = c.get("/cb/x")
+        assert r.status_code == 503
+        assert r.get_json()["error"] == "no healthy upstream"
+
+
+def test_breaker_records_success_on_2xx():
+    """A successful request through the gateway marks the breaker happy."""
+    STATS.reset()
+    routes = RouteTable([
+        Route("/ok", ("http://127.0.0.1:9101",), strip_prefix=False),
+    ])
+    app = create_gateway(route_table=routes)
+    app.config["TESTING"] = True
+
+    pools = app.extensions["pools"]
+    upstream = pools.pool_for("/ok").upstreams()[0]
+
+    with app.test_client() as c:
+        r = c.get("/ok/x")
+        assert r.status_code == 200
+
+    snap = upstream.breaker.snapshot()
+    assert snap["state"] == "closed"
+    assert snap["window_samples"] == 1
+    assert snap["window_failures"] == 0
+
+
+def test_breaker_ignores_4xx():
+    """4xx responses are the client's fault, not the upstream's."""
+    STATS.reset()
+    routes = RouteTable([
+        Route("/404", ("http://127.0.0.1:9101",), strip_prefix=False),
+    ])
+    app = create_gateway(route_table=routes)
+    app.config["TESTING"] = True
+
+    pools = app.extensions["pools"]
+    upstream = pools.pool_for("/404").upstreams()[0]
+
+    from app.gateway import _record_breaker_outcome
+    _record_breaker_outcome(upstream, 404)
+
+    snap = upstream.breaker.snapshot()
+    assert snap["window_samples"] == 0
+    assert snap["window_failures"] == 0
+
+
+def test_breaker_records_502_as_failure():
+    """A 502 (upstream unreachable) counts as a breaker failure."""
+    STATS.reset()
+    routes = RouteTable([
+        Route("/dead", ("http://127.0.0.1:1",), strip_prefix=False),
+    ])
+    app = create_gateway(route_table=routes)
+    app.config["TESTING"] = True
+
+    pools = app.extensions["pools"]
+    upstream = pools.pool_for("/dead").upstreams()[0]
+
+    with app.test_client() as c:
+        r = c.get("/dead/x")
+        assert r.status_code == 502
+
+    snap = upstream.breaker.snapshot()
+    assert snap["window_samples"] == 1
+    assert snap["window_failures"] == 1
+
+
+def test_breaker_full_lifecycle_through_gateway():
+    """End to end: trip, cooldown, probe, close."""
+    import time
+    from app.circuit import BreakerState
+
+    STATS.reset()
+    routes = RouteTable([
+        Route("/cyc", ("http://127.0.0.1:9101",), strip_prefix=False),
+    ])
+    app = create_gateway(route_table=routes)
+    app.config["TESTING"] = True
+
+    pools = app.extensions["pools"]
+    upstream = pools.pool_for("/cyc").upstreams()[0]
+
+    # Shorten the cooldown for the test
+    upstream.breaker.cooldown_seconds = 0.1
+
+    for _ in range(5):
+        upstream.breaker.record(False)
+    assert upstream.breaker.state() == BreakerState.OPEN
+
+    with app.test_client() as c:
+        assert c.get("/cyc/x").status_code == 503
+
+    time.sleep(0.15)
+    assert upstream.breaker.state() == BreakerState.HALF_OPEN
+
+    with app.test_client() as c:
+        assert c.get("/cyc/x").status_code == 200
+
+    assert upstream.breaker.state() == BreakerState.CLOSED

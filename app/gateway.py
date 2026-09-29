@@ -15,6 +15,24 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("mlinzi")
 
 
+def _record_breaker_outcome(upstream, status_code: int) -> None:
+    """Tell the breaker whether a forwarded request succeeded.
+
+    Heuristic:
+      - 2xx, 3xx        -> success
+      - 4xx             -> ignored (client's fault, not the upstream's)
+      - 5xx             -> failure
+      - 502/504         -> failure (our own codes for upstream problems)
+    """
+    if status_code in (502, 504):
+        upstream.breaker.record(False)
+    elif 500 <= status_code < 600:
+        upstream.breaker.record(False)
+    elif 200 <= status_code < 400:
+        upstream.breaker.record(True)
+    # 4xx: no record
+
+
 def create_gateway(route_table: RouteTable | None = None) -> Flask:
     app = Flask("mlinzi")
     routes = route_table or build_route_table()
@@ -59,7 +77,6 @@ def create_gateway(route_table: RouteTable | None = None) -> Flask:
         else:
             ctx.route_prefix = route.prefix
 
-            # Rate limit check before choosing an upstream
             decision = limiters.check(route.prefix, ctx.client_ip)
             ctx.rate_decision = decision
 
@@ -80,7 +97,7 @@ def create_gateway(route_table: RouteTable | None = None) -> Flask:
                 upstream = pool.pick() if pool else None
 
                 if upstream is None:
-                    log.warning("no healthy upstream for route=%s", route.prefix)
+                    log.warning("no eligible upstream for route=%s", route.prefix)
                     resp = jsonify({
                         "error": "no healthy upstream",
                         "route": route.prefix,
@@ -88,6 +105,7 @@ def create_gateway(route_table: RouteTable | None = None) -> Flask:
                     resp.status_code = 503
                 else:
                     resp = forward(route, upstream.url, timeout=Config.REQUEST_TIMEOUT)
+                    _record_breaker_outcome(upstream, resp.status_code)
 
         ctx.status_code = resp.status_code
         run_after(ctx)
@@ -97,7 +115,6 @@ def create_gateway(route_table: RouteTable | None = None) -> Flask:
 
         return resp
 
-    # Expose the pool store so the CLI can start/stop health checks
     app.extensions["pools"] = pools
     return app
 

@@ -3,9 +3,9 @@
 A small API gateway written in Python. Routes incoming requests to upstream
 services based on path prefix, applies token-bucket rate limits per route
 and per client, load-balances across multiple upstream instances with
-background health checks, strips path prefixes when configured, returns
-proper gateway errors (502, 503, 504) when upstreams are unavailable, and
-exposes live request stats.
+background health checks and per-instance circuit breakers, strips path
+prefixes when configured, returns proper gateway errors (502, 503, 504)
+when upstreams are unavailable, and exposes live request stats.
 
 The name is Swahili for "guard" or "watchman".
 
@@ -16,6 +16,7 @@ Data plane (proxying):
 - Route table with longest-prefix matching
 - Upstream pools with round-robin load balancing
 - Background health checks that remove failing instances from rotation
+- Per-upstream circuit breakers that trip on real request failures
 - Path prefix stripping (e.g. `/api/users/1` becomes `/users/1` on the upstream)
 - Query string and request body pass-through
 - Hop-by-hop header filtering
@@ -34,7 +35,7 @@ Rate limiting:
 Management plane:
 
 - `/gateway/health` — liveness and route count
-- `/gateway/routes` — list of routes, upstreams, health, and limits
+- `/gateway/routes` — list of routes, upstreams, health, breakers, and limits
 - `/gateway/stats` — request counters, rate-limit counts, latency percentiles
 
 Middleware, run on every data-plane request:
@@ -51,8 +52,9 @@ Client --> mlinzi (port 9000) --> upstream pool (port 9001, 9002, ...)
 
              |-- route table (prefix -> upstream pool + limit)
              |-- rate limiter (token bucket per route + client)
-             |-- upstream pool (round-robin across healthy instances)
+             |-- upstream pool (round-robin across eligible instances)
              |-- health checker (background thread, pings each upstream)
+             |-- circuit breaker (per upstream, reactive to request outcomes)
              |-- proxy (forwards via requests)
              |-- middleware (request id, timing, logging, stats)
              |-- management endpoints under /gateway/*
@@ -130,19 +132,19 @@ curl http://127.0.0.1:9000/gateway/stats
 
 ## Route configuration
 
-Routes and rate limits are defined in `app/routes.py`:
+Routes, upstream pools, and rate limits are defined in `app/routes.py`:
 
 ```python
 Route(
     prefix="/api",
-    upstreams=("http://127.0.0.1:9001",),
+    upstreams=("http://127.0.0.1:9001", "http://127.0.0.1:9002"),
     strip_prefix=True,
     limit=Limit(capacity=5, refill_per_second=1.0),
 )
 ```
 
 The longest matching prefix wins. `limit=None` means the route is
-unlimited.
+unlimited. `upstreams` can be one instance or several.
 
 ## How rate limiting works
 
@@ -181,16 +183,73 @@ The health checker runs on its own daemon thread and never blocks request
 handling. State changes are logged once per transition rather than on
 every check.
 
+## Circuit breaker
+
+Each upstream instance has its own circuit breaker. It reacts to actual
+request outcomes, not just health-check pings:
+
+- **CLOSED** — normal. Successes and failures are recorded.
+- **OPEN** — tripped. No traffic goes to this instance until the cooldown
+  elapses.
+- **HALF_OPEN** — cooldown over. One trial request is allowed through.
+  Success closes the breaker; failure reopens it with a new cooldown.
+
+The breaker trips when the number of failures within a rolling window
+meets `failure_threshold`, provided at least `min_samples` outcomes have
+been observed. This prevents a single early failure from shutting down a
+healthy upstream.
+
+Which responses count:
+
+- 2xx, 3xx: success
+- 4xx: ignored (client's fault, not the upstream's)
+- 5xx: failure
+- 502, 504: failure
+
+**Health checks and the circuit breaker solve different problems.** Health
+checks catch instances that are down. The breaker catches instances that
+are up but misbehaving — returning 500s on real requests while still
+responding to health pings. You need both to keep traffic away from a
+broken upstream.
+
+The breaker uses no background thread. State transitions happen lazily
+when `state()` or `allow_request()` is called. This keeps the code simple
+and avoids a thread per upstream.
+
+## Testing the circuit breaker
+
+The repo includes a test upstream that can be toggled between healthy and
+failing modes:
+
+```bash
+python -m scripts.flaky_upstream 9002
+```
+
+Control it over HTTP:
+
+```bash
+curl http://127.0.0.1:9002/_control/fail   # make it return 500s
+curl http://127.0.0.1:9002/_control/ok     # make it return 200s
+curl http://127.0.0.1:9002/_control/status # show current mode
+```
+
+Add a route pointing at both the echo upstream and the flaky one, hit it
+enough times to trip the breaker, then watch the routes endpoint show the
+breaker in `open` state. Fix the flaky upstream, wait for the cooldown,
+and the breaker closes again automatically.
+
 ## Tests
 
 ```bash
 python -m pytest
 ```
 
-Fifty-three tests covering route matching, prefix stripping, forwarding
+Seventy-three tests covering route matching, prefix stripping, forwarding
 through a real echo upstream, middleware headers, stats collection,
 gateway error paths (404, 502, 503), the token bucket algorithm including
-refill and capacity caps, and per-route rate limit isolation.
+refill and capacity caps, per-route rate limit isolation, and the circuit
+breaker state machine (all transitions, window pruning, half-open probe
+semantics).
 
 ## Project layout
 
@@ -202,6 +261,7 @@ mlinzi/
 │   ├── routes.py         route table with per-route pools and limits
 │   ├── upstream.py       upstream instances and round-robin pools
 │   ├── health.py         background health checker thread
+│   ├── circuit.py        circuit breaker state machine
 │   ├── pool_store.py     one pool per route, plus health checkers
 │   ├── ratelimit.py      token bucket and limiter registry
 │   ├── limiter_store.py  one limiter per route
@@ -209,6 +269,8 @@ mlinzi/
 │   ├── stats.py          thread-safe request counters
 │   ├── config.py         env-based settings
 │   └── echo_upstream.py  bundled test upstream
+├── scripts/
+│   └── flaky_upstream.py toggleable failing upstream for testing
 ├── tests/
 ├── docs/
 └── requirements.txt
@@ -218,7 +280,6 @@ mlinzi/
 
 Next sessions:
 
-- Circuit breaker
 - Architecture diagram
 - `docs/DESIGN.md` and `docs/FAILURES.md`
 - End-to-end demo script
